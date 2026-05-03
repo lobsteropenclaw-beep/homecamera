@@ -1,0 +1,21 @@
+api:
+  listen: ":1984"
+
+rtsp:
+  listen: ":8554"
+
+log:
+  level: info
+
+streams:
+  guest_room:
+    - wyze:YOUR_CAMERA_MAC_1
+  outdoor:
+    - wyze:YOUR_CAMERA_MAC_2
+
+wyze:
+  home:
+    email: "your_wyze_email@example.com"
+    password: "your_wyze_password"
+    key_id: "your_api_id"
+    api_key: "your_api_key"

@@ -1,0 +1,29 @@
+# Secrets — never commit
+.env
+go2rtc.yaml
+
+# Runtime data
+recordings/
+src/frontend/hls/
+*.pid
+*.log
+
+# Python
+venv/
+venv_wyze/
+__pycache__/
+*.pyc
+*.pyo
+
+# Binaries & firmware
+go2rtc
+wyze_firmware/
+
+# Claude Code project settings (may contain shell history with credentials)
+.claude/
+
+# Old unused config (IPs not updated to current layout)
+config/
+
+# macOS
+.DS_Store

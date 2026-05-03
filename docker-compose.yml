@@ -1,0 +1,16 @@
+services:
+  wyze-bridge:
+    image: mrlt8/wyze-bridge:latest
+    restart: unless-stopped
+    ports:
+      - "8554:8554"   # RTSP — cameras will stream here
+      - "8888:8888"   # HLS  — play in browser directly
+      - "1984:1984"   # go2rtc web UI inside the bridge
+    environment:
+      - WYZE_EMAIL=${WYZE_EMAIL}
+      - WYZE_PASSWORD=${WYZE_PASSWORD}
+      - API_ID=${WYZE_API_ID}
+      - API_KEY=${WYZE_API_KEY}
+      - WB_IP=0.0.0.0
+    volumes:
+      - ./recordings:/recordings
