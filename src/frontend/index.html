@@ -176,7 +176,7 @@ function buildLorexTile(cam) {
         <div class="camera-label">
             <span>
                 <span class="live-badge">LIVE</span>
-                <span class="${dotClass(cam.status)}">●</span> ${cam.name}
+                <span id="dot-${cam.id}" class="${dotClass(cam.status)}">●</span> ${cam.name}
             </span>
             <span class="last-seen" id="ts-${cam.id}"></span>
         </div>`;
@@ -268,12 +268,17 @@ async function loadCameras() {
         statusBadge.style.background = '#2e7d32';
 
         data.cameras.forEach(cam => {
-            if (builtTiles[cam.id]) return;   // tile already in DOM
+            // Always refresh the status dot for existing tiles
+            const dot = document.getElementById('dot-' + cam.id);
+            if (dot) {
+                dot.className = dotClass(cam.status);
+            }
+
+            if (builtTiles[cam.id]) return;   // tile already in DOM, dot updated above
             builtTiles[cam.id] = cam.type;
 
-            let tile;
             if (cam.type === 'lorex' || cam.type === 'ezviz' || cam.type === 'wyze_rtsp') {
-                tile = buildLorexTile(cam);
+                const tile = buildLorexTile(cam);
                 grid.appendChild(tile);
                 setTimeout(() => attachHLS(cam), 300);
             }
@@ -284,14 +289,15 @@ async function loadCameras() {
     }
 }
 
+loadCameras();
+setInterval(loadCameras, 30000);  // refresh status dots every 30 s
+
 async function sendPTZ(id, action) {
     await fetch('/api/ptz', {
         method: 'POST', headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({camera_id: id, action})
     }).catch(() => {});
 }
-
-loadCameras();
 
 // ── Recordings modal ─────────────────────────────────────────────────────────
 let _recCamId = null;
