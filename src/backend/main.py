@@ -5,6 +5,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from starlette.middleware.base import BaseHTTPMiddleware
 from lorex_controller import LorexController
 from storage_service import StorageService
 from dotenv import load_dotenv
@@ -12,6 +13,27 @@ from dotenv import load_dotenv
 load_dotenv()
 
 app = FastAPI()
+
+
+# Serving HLS files (m3u8 + segments) without cache headers is critical:
+# ffmpeg reuses segment filenames after a watchdog restart (delete_segments
+# means seg000.ts gets overwritten with new content). If the browser cached
+# the old seg000.ts, hls.js will replay stale frames and the dashboard freezes
+# even though the server is healthy. We strip etag/last-modified and force
+# no-store so every HLS fetch hits disk fresh.
+class NoCacheHLS(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        response = await call_next(request)
+        if request.url.path.startswith("/hls/"):
+            response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+            response.headers["Pragma"] = "no-cache"
+            for h in ("etag", "last-modified"):
+                if h in response.headers:
+                    del response.headers[h]
+        return response
+
+
+app.add_middleware(NoCacheHLS)
 
 # Lorex credentials & known cameras
 lorex_user = os.getenv("LOREX_USER", "admin")
@@ -184,6 +206,73 @@ def control_camera(cmd: PTZCommand):
     if not ok:
         raise HTTPException(status_code=502, detail="PTZ move failed")
     return {"status": "success", "camera_id": cmd.camera_id, "action": cmd.action}
+
+
+@app.get("/api/diag/{camera_id}")
+def diag(camera_id: str):
+    """Diagnostic state for one camera — dashboard logs this when recovery fails
+    repeatedly so we can see whether the issue is server-side (ffmpeg dead, no
+    fresh segments) or client-side (server fine, browser stuck)."""
+    import re, time as _time
+    if not re.match(r'^[a-zA-Z0-9_]+$', camera_id):
+        raise HTTPException(400)
+
+    pidfile = Path(f"{camera_id}.pid")
+    logfile = Path(f"ffmpeg_{camera_id}.log")
+    hls_dir = Path("src/frontend/hls") / camera_id
+    rec_dir = Path("recordings") / camera_id
+    now = _time.time()
+
+    watchdog_pid = None
+    watchdog_alive = False
+    if pidfile.exists():
+        try:
+            watchdog_pid = int(pidfile.read_text().strip())
+            os.kill(watchdog_pid, 0)
+            watchdog_alive = True
+        except (ValueError, OSError):
+            pass
+
+    latest_seg = latest_seg_age = m3u8_age = None
+    if hls_dir.exists():
+        segs = sorted(hls_dir.glob("seg*.ts"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if segs:
+            latest_seg = segs[0].name
+            latest_seg_age = round(now - segs[0].stat().st_mtime, 1)
+        m3u8 = hls_dir / "stream.m3u8"
+        if m3u8.exists():
+            m3u8_age = round(now - m3u8.stat().st_mtime, 1)
+
+    latest_rec = latest_rec_age = None
+    if rec_dir.exists():
+        recs = sorted(rec_dir.glob("*.ts"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if recs:
+            latest_rec = recs[0].name
+            latest_rec_age = round(now - recs[0].stat().st_mtime, 1)
+
+    restart_count = 0
+    last_log_lines: list = []
+    if logfile.exists():
+        try:
+            content = logfile.read_text(errors="replace")
+            restart_count = content.count("restarting in 5s")
+            non_empty = [l for l in content.splitlines() if l.strip()]
+            last_log_lines = non_empty[-5:]
+        except Exception:
+            pass
+
+    return {
+        "camera_id": camera_id,
+        "watchdog_pid": watchdog_pid,
+        "watchdog_alive": watchdog_alive,
+        "latest_segment": latest_seg,
+        "latest_segment_age_s": latest_seg_age,
+        "m3u8_age_s": m3u8_age,
+        "latest_recording": latest_rec,
+        "latest_recording_age_s": latest_rec_age,
+        "restart_count": restart_count,
+        "last_log_lines": last_log_lines,
+    }
 
 
 @app.get("/api/recordings/{camera_id}")

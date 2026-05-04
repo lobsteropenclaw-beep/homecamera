@@ -184,77 +184,145 @@ function buildLorexTile(cam) {
     return tile;
 }
 
+// Attach a self-healing HLS player to a tile. Tracks freshness via the timestamp
+// of the last loaded fragment (not video.currentTime, which can drift slightly
+// even when the stream is dead and which goes to zero when the player pauses on
+// error). Single-flight reload prevents multiple concurrent fatal-error events
+// from scheduling overlapping retries — that pattern was leaving tiles stuck on
+// the "retrying…" placeholder while zombie HLS instances fought over the video
+// element. On 2nd+ consecutive failure we hit /api/diag/<cam> and console.log
+// the server-side state so it's obvious whether ffmpeg is dead or fine.
 function attachHLS(cam) {
     const video = document.getElementById('vid-' + cam.id);
     const ph    = document.getElementById('ph-' + cam.id);
     if (!video || !cam.stream) return;
 
     const streamUrl = cam.stream;
-    let frozenTimer = null;
-    let lastTime = -1;
+    let hls = null;
+    let watchTimer = null;
+    let reloadPending = false;
+    let lastFragTime = 0;          // Date.now() of last successful FRAG_LOADED
+    let consecutiveFailures = 0;
+    let hiddenSince = 0;
 
-    // Detect a frozen live stream: if currentTime hasn't advanced in 12 s while
-    // playing, the camera has stalled. Destroy and recreate the HLS instance so
-    // we jump back to the live edge once ffmpeg recovers.
-    function startFrozenWatch(hls) {
-        if (frozenTimer) clearInterval(frozenTimer);
-        lastTime = -1;
-        frozenTimer = setInterval(() => {
-            if (video.paused || video.ended) return;
-            if (lastTime >= 0 && video.currentTime === lastTime) {
-                clearInterval(frozenTimer);
-                ph.classList.remove('hidden');
-                ph.querySelector('div:last-child').textContent = 'Stream unavailable — retrying…';
-                hls.destroy();
-                setTimeout(tryPlay, 3000);
+    const log = (msg, ...rest) => {
+        console.log(`[${new Date().toLocaleTimeString()}][${cam.id}] ${msg}`, ...rest);
+    };
+    const showPh = (msg) => {
+        ph.classList.remove('hidden');
+        ph.querySelector('div:last-child').textContent = msg;
+    };
+    const hidePh = () => ph.classList.add('hidden');
+
+    function destroyHls() {
+        if (watchTimer) { clearInterval(watchTimer); watchTimer = null; }
+        if (hls) { try { hls.destroy(); } catch (e) { log('destroy err', e); } hls = null; }
+    }
+
+    function scheduleReload(delayMs, reason) {
+        if (reloadPending) { log('reload already pending, skip:', reason); return; }
+        reloadPending = true;
+        log(`reload in ${delayMs}ms — ${reason}`);
+        showPh('Stream unavailable — retrying…');
+        setTimeout(() => {
+            log(`reload now — ${reason}`);
+            destroyHls();
+            reloadPending = false;
+            tryPlay();
+        }, delayMs);
+    }
+
+    async function logServerDiag() {
+        try {
+            const r = await fetch(`/api/diag/${cam.id}`);
+            log('SERVER DIAG:', await r.json());
+        } catch (e) { log('diag fetch failed', e); }
+    }
+
+    function startWatch() {
+        if (watchTimer) clearInterval(watchTimer);
+        lastFragTime = Date.now();
+        watchTimer = setInterval(() => {
+            const ageMs = Date.now() - lastFragTime;
+            if (ageMs > 15000 && !reloadPending) {
+                log(`STUCK: no fragment for ${ageMs}ms (failures=${consecutiveFailures})`);
+                consecutiveFailures += 1;
+                if (consecutiveFailures >= 2) logServerDiag();
+                scheduleReload(2000, `no fragments for ${ageMs}ms`);
             }
-            lastTime = video.currentTime;
-        }, 12000);
+        }, 5000);
     }
 
     function tryPlay() {
-        if (Hls.isSupported()) {
-            const hls = new Hls({
-                liveSyncDurationCount: 2,
-                liveMaxLatencyDurationCount: 4,
-                maxBufferLength: 4,
-                maxMaxBufferLength: 8,
-                // Jump straight to live edge on recovery — no fast-play catch-up loop
-                maxLiveSyncPlaybackRate: 1,
-                liveBackBufferLength: 0,
-            });
-            hls.loadSource(streamUrl);
-            hls.attachMedia(video);
-            hls.on(Hls.Events.MANIFEST_PARSED, () => {
-                video.play().catch(() => {});
-                ph.classList.add('hidden');
-                startFrozenWatch(hls);
-            });
-            hls.on(Hls.Events.FRAG_LOADED, () => {
-                lastTime = -1;  // reset frozen baseline on each new fragment
-                const ts = document.getElementById('ts-' + cam.id);
-                if (ts) ts.textContent = new Date().toLocaleTimeString();
-            });
-            hls.on(Hls.Events.ERROR, (_, data) => {
-                if (data.fatal) {
-                    clearInterval(frozenTimer);
-                    ph.classList.remove('hidden');
-                    ph.querySelector('div:last-child').textContent = 'Stream unavailable — retrying…';
-                    // Full destroy+recreate so hls.js starts at live edge, not mid-buffer
-                    setTimeout(() => { hls.destroy(); tryPlay(); }, 8000);
-                }
-            });
-        } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-            // Safari native HLS
-            video.src = streamUrl;
-            video.addEventListener('loadedmetadata', () => {
-                video.play().catch(() => {});
-                ph.classList.add('hidden');
-            }, { once: true });
-        } else {
-            ph.querySelector('div:last-child').textContent = 'HLS not supported in this browser';
+        if (!Hls.isSupported()) {
+            // Safari native HLS path — no recovery logic, browser handles it
+            if (video.canPlayType('application/vnd.apple.mpegurl')) {
+                video.src = streamUrl + '?t=' + Date.now();
+                video.addEventListener('loadedmetadata', () => {
+                    video.play().catch(() => {});
+                    hidePh();
+                }, { once: true });
+            } else {
+                showPh('HLS not supported in this browser');
+            }
+            return;
         }
+
+        log('creating new HLS instance');
+        hls = new Hls({
+            liveSyncDurationCount: 2,
+            liveMaxLatencyDurationCount: 4,
+            maxBufferLength: 4,
+            maxMaxBufferLength: 8,
+            // Jump straight to live edge on recovery — no fast-play catch-up loop
+            maxLiveSyncPlaybackRate: 1,
+            liveBackBufferLength: 0,
+            // Cache-bust every HLS request. ffmpeg reuses segment names after a
+            // watchdog restart, so the browser's HTTP cache must never serve a
+            // stale seg000.ts from a previous run.
+            xhrSetup: (xhr, url) => {
+                const sep = url.includes('?') ? '&' : '?';
+                xhr.open('GET', url + sep + '_t=' + Date.now(), true);
+            },
+        });
+        hls.loadSource(streamUrl);
+        hls.attachMedia(video);
+
+        hls.on(Hls.Events.MANIFEST_PARSED, () => {
+            log('MANIFEST_PARSED');
+            video.play().catch((e) => log('play() rejected:', e));
+            hidePh();
+            startWatch();
+        });
+        hls.on(Hls.Events.FRAG_LOADED, () => {
+            lastFragTime = Date.now();
+            consecutiveFailures = 0;
+            const ts = document.getElementById('ts-' + cam.id);
+            if (ts) ts.textContent = new Date().toLocaleTimeString();
+        });
+        hls.on(Hls.Events.ERROR, (_, data) => {
+            if (!data.fatal) return;
+            log('FATAL ERROR', data.type, data.details);
+            consecutiveFailures += 1;
+            if (consecutiveFailures >= 2) logServerDiag();
+            scheduleReload(8000, `fatal: ${data.details}`);
+        });
     }
+
+    // Browsers throttle setInterval/setTimeout in background tabs to ~once/min,
+    // so the watchdog above can't run normally. When the tab becomes visible
+    // again, force a reload to skip whatever stale buffered data is sitting in
+    // the video element and jump back to live.
+    document.addEventListener('visibilitychange', () => {
+        if (document.hidden) {
+            hiddenSince = Date.now();
+        } else {
+            const hiddenMs = hiddenSince ? Date.now() - hiddenSince : 0;
+            log(`tab visible again, was hidden ${hiddenMs}ms`);
+            if (hiddenMs > 5000) scheduleReload(500, 'tab became visible');
+        }
+    });
+
     tryPlay();
 }
 
