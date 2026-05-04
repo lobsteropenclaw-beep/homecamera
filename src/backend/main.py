@@ -208,6 +208,19 @@ def list_recordings(camera_id: str):
     return {"camera_id": camera_id, "recordings": result, "recording": recording_active}
 
 
+def _ts_duration(path: Path) -> float:
+    import subprocess
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+            capture_output=True, text=True, timeout=4,
+        )
+        return float(r.stdout.strip())
+    except Exception:
+        return 300.0
+
+
 @app.get("/api/recordings/{camera_id}/{filename}/stream.m3u8")
 def recording_stream(camera_id: str, filename: str):
     import re, time as _time
@@ -219,11 +232,12 @@ def recording_stream(camera_id: str, filename: str):
     if not ts_path.exists():
         raise HTTPException(404)
     is_active = (_time.time() - ts_path.stat().st_mtime) < 30
+    duration = _ts_duration(ts_path)
     ts_url = f"/recordings/{camera_id}/{filename}"
     m3u8 = (
         "#EXTM3U\n#EXT-X-VERSION:3\n"
-        "#EXT-X-TARGETDURATION:300\n"
-        "#EXTINF:300.0,\n"
+        f"#EXT-X-TARGETDURATION:{int(duration) + 1}\n"
+        f"#EXTINF:{duration:.3f},\n"
         f"{ts_url}\n"
     )
     if not is_active:

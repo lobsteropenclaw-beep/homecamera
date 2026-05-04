@@ -190,6 +190,27 @@ function attachHLS(cam) {
     if (!video || !cam.stream) return;
 
     const streamUrl = cam.stream;
+    let frozenTimer = null;
+    let lastTime = -1;
+
+    // Detect a frozen live stream: if currentTime hasn't advanced in 12 s while
+    // playing, the camera has stalled. Destroy and recreate the HLS instance so
+    // we jump back to the live edge once ffmpeg recovers.
+    function startFrozenWatch(hls) {
+        if (frozenTimer) clearInterval(frozenTimer);
+        lastTime = -1;
+        frozenTimer = setInterval(() => {
+            if (video.paused || video.ended) return;
+            if (lastTime >= 0 && video.currentTime === lastTime) {
+                clearInterval(frozenTimer);
+                ph.classList.remove('hidden');
+                ph.querySelector('div:last-child').textContent = 'Stream unavailable — retrying…';
+                hls.destroy();
+                setTimeout(tryPlay, 3000);
+            }
+            lastTime = video.currentTime;
+        }, 12000);
+    }
 
     function tryPlay() {
         if (Hls.isSupported()) {
@@ -207,13 +228,16 @@ function attachHLS(cam) {
             hls.on(Hls.Events.MANIFEST_PARSED, () => {
                 video.play().catch(() => {});
                 ph.classList.add('hidden');
+                startFrozenWatch(hls);
             });
             hls.on(Hls.Events.FRAG_LOADED, () => {
+                lastTime = -1;  // reset frozen baseline on each new fragment
                 const ts = document.getElementById('ts-' + cam.id);
                 if (ts) ts.textContent = new Date().toLocaleTimeString();
             });
             hls.on(Hls.Events.ERROR, (_, data) => {
                 if (data.fatal) {
+                    clearInterval(frozenTimer);
                     ph.classList.remove('hidden');
                     ph.querySelector('div:last-child').textContent = 'Stream unavailable — retrying…';
                     // Full destroy+recreate so hls.js starts at live edge, not mid-buffer

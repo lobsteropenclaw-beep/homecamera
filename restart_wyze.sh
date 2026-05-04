@@ -45,7 +45,7 @@ for cam_id in wyze_126 wyze_105; do
     mkdir -p "$hls_dir" "recordings/${cam_id}"
     > "ffmpeg_${cam_id}.log"
     start_watched "${cam_id}.pid" "ffmpeg_${cam_id}.log" \
-        ffmpeg -rtsp_transport tcp -timeout 20000000 -use_wallclock_as_timestamps 1 \
+        ffmpeg -rtsp_transport tcp -timeout 8000000 -use_wallclock_as_timestamps 1 \
         -fflags +discardcorrupt \
         -an \
         -i "$rtsp_url" \

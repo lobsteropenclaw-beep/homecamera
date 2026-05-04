@@ -114,7 +114,8 @@ done
 # 5b. Start Ezviz HLS streams (URL paths differ by model)
 # Audio is dropped (-an): Ezviz substream audio has erratic timestamps that
 # back up the AAC encoder and cause ffmpeg to exit every minute or two,
-# breaking the dashboard live preview. Recording (5d) keeps audio via main stream.
+# breaking the dashboard live preview. Recording (6b) keeps audio via main stream.
+# discardcorrupt: prevents "Invalid data found" mux errors from crashing ffmpeg.
 mkdir -p src/frontend/hls/ezviz_78 src/frontend/hls/ezviz_120
 for cam_id in ezviz_78 ezviz_120; do
     ip_var="$(echo "$cam_id" | tr '[:lower:]' '[:upper:]')_IP"
@@ -131,6 +132,7 @@ for cam_id in ezviz_78 ezviz_120; do
     > "ffmpeg_${cam_id}.log"
     start_watched "${cam_id}.pid" "ffmpeg_${cam_id}.log" \
         ffmpeg $LOREX_RTSP_OPTS \
+        -fflags +discardcorrupt \
         -an \
         -i "$rtsp_url" \
         -c:v copy \
@@ -144,8 +146,9 @@ done
 # Wyze V2 RTSP firmware only allows one concurrent RTSP connection, so HLS and
 # recording must share one input stream via multiple output mapping.
 # Audio is dropped (-an): Wyze V2 audio has erratic timestamps that cause the
-# AAC encoder to back up and stall the entire pipeline. Longer read timeout
-# (20s) tolerates the V2's frequent video stalls without triggering restarts.
+# AAC encoder to back up and stall the entire pipeline.
+# Timeout 8s: V2 firmware stalls and never recovers without a full reconnect;
+# 8s balances fast recovery vs. not restarting on brief bursts.
 for cam_id in wyze_126 wyze_105; do
     ip_var="$(echo "$cam_id" | tr '[:lower:]' '[:upper:]')_IP"
     eval cam_ip=\$$ip_var
@@ -155,7 +158,7 @@ for cam_id in wyze_126 wyze_105; do
     echo "[...] Starting HLS + recording for ${cam_id} (${cam_ip})..."
     > "ffmpeg_${cam_id}.log"
     start_watched "${cam_id}.pid" "ffmpeg_${cam_id}.log" \
-        ffmpeg -rtsp_transport tcp -timeout 20000000 -use_wallclock_as_timestamps 1 \
+        ffmpeg -rtsp_transport tcp -timeout 8000000 -use_wallclock_as_timestamps 1 \
         -fflags +discardcorrupt \
         -an \
         -i "$rtsp_url" \
@@ -189,6 +192,9 @@ for cam_id in lorex_127 lorex_122; do
 done
 
 # 6b. Start Ezviz 24/7 recordings (main stream, URL paths differ by model)
+# -c:a copy: camera already encodes AAC; copying avoids the AAC re-encoder
+# being fed backward-in-time audio packets from the Ezviz firmware, which
+# caused frequent "Queue input is backward in time" crashes.
 for cam_id in ezviz_78 ezviz_120; do
     ip_var="$(echo "$cam_id" | tr '[:lower:]' '[:upper:]')_IP"
     pw_var="$(echo "$cam_id" | tr '[:lower:]' '[:upper:]')_PASSWORD"
@@ -206,7 +212,7 @@ for cam_id in ezviz_78 ezviz_120; do
         -use_wallclock_as_timestamps 1 \
         -fflags +discardcorrupt \
         -i "$rtsp_url" \
-        -c:v copy -c:a aac \
+        -c:v copy -c:a copy \
         -f segment -segment_time 300 -strftime 1 -reset_timestamps 1 \
         "recordings/${cam_id}/%Y%m%d_%H%M%S.ts"
     echo "[✓] ${cam_id} recording watchdog PID: $(cat rec_${cam_id}.pid)"
