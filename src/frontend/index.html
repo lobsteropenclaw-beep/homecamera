@@ -305,7 +305,12 @@ function attachHLS(cam) {
             log('FATAL ERROR', data.type, data.details);
             consecutiveFailures += 1;
             if (consecutiveFailures >= 2) logServerDiag();
-            scheduleReload(8000, `fatal: ${data.details}`);
+            // Backend ffmpeg restart cycle is ~5 s (1 s watchdog sleep on
+            // clean EOF + ~4 s ffmpeg startup). Retry at 3 s — if ffmpeg
+            // isn't back yet, the next fatal will retry again at 3 s.
+            // Exponential backoff after repeated failures avoids hammering.
+            const delay = Math.min(3000 * Math.pow(2, consecutiveFailures - 1), 30000);
+            scheduleReload(delay, `fatal: ${data.details}`);
         });
     }
 

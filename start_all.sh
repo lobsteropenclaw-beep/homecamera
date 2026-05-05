@@ -31,14 +31,26 @@ echo "[✓] Python environment activated."
 # Helper: start a command in a self-restarting watchdog loop.
 # Usage: start_watched <pidfile> <logfile> <cmd...>
 # Saves the watchdog PID so stop_all.sh can kill the loop and its child.
+# Restart delay differs by exit code:
+#   code 0 → camera-side EOF (RTSP session ended cleanly). Restart in 1 s
+#            so the dashboard barely sees the gap. Cameras like Wyze V2 do
+#            this every 30 s, so a 5 s sleep was the dominant blackout cause.
+#   code != 0 → real failure (timeout, refused, codec error). Back off 5 s
+#            so we don't hammer a broken camera.
 start_watched() {
     local pidfile=$1 logfile=$2; shift 2
     (
         trap 'pkill -P $$ 2>/dev/null; exit 0' TERM INT
         while true; do
             "$@" >> "$logfile" 2>&1
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] Process exited (code $?), restarting in 5s..." >> "$logfile"
-            sleep 5
+            local code=$?
+            if [ $code -eq 0 ]; then
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] Process exited (code 0 — clean EOF), restarting in 1s..." >> "$logfile"
+                sleep 1
+            else
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] Process exited (code $code), restarting in 5s..." >> "$logfile"
+                sleep 5
+            fi
         done
     ) &
     local pid=$!
@@ -92,7 +104,10 @@ mkdir -p src/frontend/hls/lorex_127 src/frontend/hls/lorex_122
 LOREX_RTSP_OPTS="-rtsp_transport tcp -timeout 5000000 -use_wallclock_as_timestamps 1"
 # omit_endlist: don't write #EXT-X-ENDLIST when ffmpeg exits, so hls.js keeps
 # polling for new segments after a watchdog restart instead of giving up.
-LOREX_HLS_OPTS="-c:v copy -c:a aac -f hls -hls_time 1 -hls_list_size 3 -hls_flags delete_segments+split_by_time+omit_endlist"
+# hls_list_size 4: a slightly larger live window smooths over the brief moment
+# when ffmpeg is restarting (~7 s) — the player can keep playing buffered
+# segments while the new ffmpeg writes its first ones.
+LOREX_HLS_OPTS="-c:v copy -c:a aac -f hls -hls_time 1 -hls_list_size 4 -hls_flags delete_segments+split_by_time+omit_endlist"
 
 for cam_id in lorex_127 lorex_122; do
     ip_var="$(echo "$cam_id" | tr '[:lower:]' '[:upper:]')_IP"

@@ -11,8 +11,14 @@ start_watched() {
         trap 'pkill -P $$ 2>/dev/null; exit 0' TERM INT
         while true; do
             "$@" >> "$logfile" 2>&1
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] Process exited (code $?), restarting in 5s..." >> "$logfile"
-            sleep 5
+            local code=$?
+            if [ $code -eq 0 ]; then
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] Process exited (code 0 — clean EOF), restarting in 1s..." >> "$logfile"
+                sleep 1
+            else
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] Process exited (code $code), restarting in 5s..." >> "$logfile"
+                sleep 5
+            fi
         done
     ) &
     local pid=$!
