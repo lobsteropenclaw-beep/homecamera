@@ -1,11 +1,11 @@
 import os
 import requests
+import httpx
 from pathlib import Path
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-from starlette.middleware.base import BaseHTTPMiddleware
 from lorex_controller import LorexController
 from storage_service import StorageService
 from dotenv import load_dotenv
@@ -15,25 +15,13 @@ load_dotenv()
 app = FastAPI()
 
 
-# Serving HLS files (m3u8 + segments) without cache headers is critical:
-# ffmpeg reuses segment filenames after a watchdog restart (delete_segments
-# means seg000.ts gets overwritten with new content). If the browser cached
-# the old seg000.ts, hls.js will replay stale frames and the dashboard freezes
-# even though the server is healthy. We strip etag/last-modified and force
-# no-store so every HLS fetch hits disk fresh.
-class NoCacheHLS(BaseHTTPMiddleware):
-    async def dispatch(self, request, call_next):
-        response = await call_next(request)
-        if request.url.path.startswith("/hls/"):
-            response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
-            response.headers["Pragma"] = "no-cache"
-            for h in ("etag", "last-modified"):
-                if h in response.headers:
-                    del response.headers[h]
-        return response
-
-
-app.add_middleware(NoCacheHLS)
+# ── mediamtx topology ──────────────────────────────────────────────────────────
+# mediamtx runs on localhost: HLS on 8888, HTTP API on 9997. Each camera has
+# either one path (Wyze, single RTSP allowed) or two (Lorex/Ezviz: a main-stream
+# path used for recording, and a `_live` sub-stream path used for browser HLS).
+# This dict maps cam_id → (live_path_for_hls, recording_path_for_storage).
+MEDIAMTX_HLS = "http://127.0.0.1:8888"
+MEDIAMTX_API = "http://127.0.0.1:9997"
 
 # Lorex credentials & known cameras
 lorex_user = os.getenv("LOREX_USER", "admin")
@@ -58,6 +46,19 @@ WYZE_RTSP_CAMERAS = [
     {"id": "wyze_126", "name": "Wyze Cam V2 - 1", "ip": os.getenv("WYZE_126_IP")},
     {"id": "wyze_105", "name": "Wyze Cam V2 - 2", "ip": os.getenv("WYZE_105_IP")},
 ]
+
+
+def _hls_path(cam_id: str, cam_type: str) -> str:
+    """mediamtx path used for browser HLS playback (sub stream where available)."""
+    if cam_type in ("lorex", "ezviz"):
+        return f"{cam_id}_live"
+    return cam_id  # Wyze: single stream serves both HLS and recording
+
+
+def _recording_path(cam_id: str) -> str:
+    """mediamtx path used for 24/7 recording (always main stream / cam_id)."""
+    return cam_id
+
 
 storage = StorageService("./recordings")
 
@@ -88,83 +89,43 @@ class PTZCommand(BaseModel):
     action: str
 
 
-def _lorex_status(cam: dict) -> dict:
-    """Quick reachability check for a Lorex camera."""
+def _socket_online(ip: str, port: int = 554, timeout: float = 2.0) -> bool:
     import socket
     try:
-        s = socket.create_connection((cam["ip"], 554), timeout=2)
+        s = socket.create_connection((ip, port), timeout=timeout)
         s.close()
-        online = True
+        return True
     except OSError:
-        online = False
+        return False
+
+
+def _camera_status(cam: dict, cam_type: str, ptz: bool) -> dict:
     return {
         "id": cam["id"],
         "name": cam["name"],
-        "type": "lorex",
-        "status": "online" if online else "offline",
+        "type": cam_type,
+        "status": "online" if _socket_online(cam["ip"]) else "offline",
         "ip": cam["ip"],
-        "stream": f"/hls/{cam['id']}/stream.m3u8",
-        "ptz": True,
-    }
-
-
-def _ezviz_status(cam: dict) -> dict:
-    """Quick reachability check for an Ezviz camera."""
-    import socket
-    try:
-        s = socket.create_connection((cam["ip"], 554), timeout=2)
-        s.close()
-        online = True
-    except OSError:
-        online = False
-    return {
-        "id": cam["id"],
-        "name": cam["name"],
-        "type": "ezviz",
-        "status": "online" if online else "offline",
-        "ip": cam["ip"],
-        "stream": f"/hls/{cam['id']}/stream.m3u8",
-        "ptz": False,
-    }
-
-
-def _wyze_rtsp_status(cam: dict) -> dict:
-    """Quick reachability check for a Wyze camera with RTSP firmware."""
-    import socket
-    try:
-        s = socket.create_connection((cam["ip"], 554), timeout=2)
-        s.close()
-        online = True
-    except OSError:
-        online = False
-    return {
-        "id": cam["id"],
-        "name": cam["name"],
-        "type": "wyze_rtsp",
-        "status": "online" if online else "offline",
-        "ip": cam["ip"],
-        "stream": f"/hls/{cam['id']}/stream.m3u8",
-        "ptz": False,
+        "stream": f"/hls/{_hls_path(cam['id'], cam_type)}/index.m3u8",
+        "ptz": ptz,
     }
 
 
 @app.get("/api/status")
 def get_status():
-    camera_list = [_lorex_status(c) for c in LOREX_CAMERAS]
-    camera_list += [_ezviz_status(c) for c in EZVIZ_CAMERAS]
-    camera_list += [_wyze_rtsp_status(c) for c in WYZE_RTSP_CAMERAS]
-
+    cams = [_camera_status(c, "lorex", True) for c in LOREX_CAMERAS]
+    cams += [_camera_status(c, "ezviz", False) for c in EZVIZ_CAMERAS]
+    cams += [_camera_status(c, "wyze_rtsp", False) for c in WYZE_RTSP_CAMERAS]
     return {
         "nvr_status": "active",
         "storage_path": os.path.abspath("./recordings"),
-        "cameras": camera_list,
+        "cameras": cams,
     }
 
 
 @app.get("/api/snapshot/{camera_id}")
 def get_snapshot(camera_id: str):
-    """Snapshot endpoint — ONVIF digest for Lorex, event thumbnail for Wyze."""
-    # Lorex: fetch via ONVIF HTTP snapshot with Digest auth
+    """Snapshot endpoint — ONVIF digest for Lorex cameras."""
     lorex = next((c for c in LOREX_CAMERAS if c["id"] == camera_id), None)
     if lorex:
         url = (f"http://{lorex['ip']}/onvifsnapshot/media_service/snapshot"
@@ -180,7 +141,6 @@ def get_snapshot(camera_id: str):
                             headers={"Cache-Control": "no-store"})
         except Exception as e:
             raise HTTPException(status_code=502, detail=f"Lorex snapshot error: {e}")
-
     raise HTTPException(status_code=404, detail=f"Unknown camera: {camera_id}")
 
 
@@ -188,10 +148,8 @@ def get_snapshot(camera_id: str):
 def control_camera(cmd: PTZCommand):
     if cmd.action not in _PTZ_MOVES:
         raise HTTPException(status_code=400, detail=f"Unknown action: {cmd.action}")
-
     ctrl = _ptz_controllers.get(cmd.camera_id)
     if not ctrl:
-        # Try reconnecting once
         cam = next((c for c in LOREX_CAMERAS if c["id"] == cmd.camera_id), None)
         if not cam:
             raise HTTPException(status_code=404, detail=f"Unknown camera: {cmd.camera_id}")
@@ -200,81 +158,153 @@ def control_camera(cmd: PTZCommand):
             _ptz_controllers[cmd.camera_id] = ctrl
         else:
             raise HTTPException(status_code=503, detail=f"Cannot connect to PTZ on {cmd.camera_id}")
-
     dx, dy = _PTZ_MOVES[cmd.action]
-    ok = ctrl.relative_move(dx, dy)
-    if not ok:
+    if not ctrl.relative_move(dx, dy):
         raise HTTPException(status_code=502, detail="PTZ move failed")
     return {"status": "success", "camera_id": cmd.camera_id, "action": cmd.action}
 
 
+# ── HLS proxy to mediamtx ─────────────────────────────────────────────────────
+# Proxy /hls/<anything> → http://127.0.0.1:8888/<anything>. Lets the dashboard
+# stay on a single port (8000) and lets us strip cache headers so the browser
+# can never serve stale segments from before a mediamtx restart.
+#
+# mediamtx tracks HLS sessions via a hlsSession cookie. The proxy must:
+#   1. Forward the browser's Cookie header upstream so mediamtx recognises the
+#      session on subsequent requests for sub-playlists / segments.
+#   2. Forward mediamtx's Set-Cookie back to the browser, but strip the
+#      Path attribute — mediamtx sets Path=/<stream>/ which would prevent
+#      the browser from sending the cookie back through /hls/<stream>/.
+#   3. Rewrite redirect Location: from /<stream>/… to /hls/<stream>/… so the
+#      browser stays inside the proxy.
+import re
+
+def _rewrite_cookie_path(value: str) -> str:
+    """Strip cookie attributes mediamtx sets that would prevent the browser
+    from sending the cookie back through this proxy:
+      Path=/<stream>/  → would scope the cookie too narrowly
+      Secure           → would require HTTPS (we serve HTTP locally)
+      SameSite=None    → only meaningful with Secure
+      Partitioned      → newer flag, mostly cross-site, irrelevant here"""
+    for attr_re in (
+        r";\s*Path=[^;]*",
+        r";\s*Secure(?=;|$)",
+        r";\s*SameSite=[^;]*",
+        r";\s*Partitioned(?=;|$)",
+    ):
+        value = re.sub(attr_re, "", value, flags=re.I)
+    return value
+
+
+@app.get("/hls/{full_path:path}")
+async def proxy_hls(full_path: str, request: Request):
+    url = f"{MEDIAMTX_HLS}/{full_path}"
+    if request.url.query:
+        url += "?" + request.url.query
+    upstream_headers = {}
+    cookie = request.headers.get("cookie")
+    if cookie:
+        upstream_headers["cookie"] = cookie
+    try:
+        async with httpx.AsyncClient(timeout=10.0, follow_redirects=False) as client:
+            r = await client.get(url, headers=upstream_headers)
+    except httpx.RequestError as e:
+        raise HTTPException(503, f"mediamtx unreachable: {e}")
+
+    resp = Response(
+        content=r.content,
+        status_code=r.status_code,
+        media_type=r.headers.get("content-type", "application/octet-stream"),
+    )
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+    resp.headers["Pragma"] = "no-cache"
+
+    for cv in r.headers.get_list("set-cookie"):
+        resp.headers.append("set-cookie", _rewrite_cookie_path(cv))
+
+    if r.status_code in (301, 302, 303, 307, 308):
+        loc = r.headers.get("location", "")
+        if loc.startswith("/"):
+            resp.headers["location"] = "/hls" + loc
+        else:
+            resp.headers["location"] = loc
+    return resp
+
+
+# ── Diagnostics ───────────────────────────────────────────────────────────────
+def _mediamtx_path_state(path_name: str) -> dict:
+    """Query mediamtx HTTP API for one path's state. Returns {} on any error."""
+    try:
+        r = requests.get(f"{MEDIAMTX_API}/v3/paths/get/{path_name}", timeout=2)
+        if r.status_code == 200:
+            return r.json()
+    except requests.RequestException:
+        pass
+    return {}
+
+
 @app.get("/api/diag/{camera_id}")
 def diag(camera_id: str):
-    """Diagnostic state for one camera — dashboard logs this when recovery fails
-    repeatedly so we can see whether the issue is server-side (ffmpeg dead, no
-    fresh segments) or client-side (server fine, browser stuck)."""
+    """Per-camera diagnostic state. Combines mediamtx's view of the path with
+    on-disk recording freshness so we can tell at a glance whether (a) the
+    upstream RTSP source is broken, (b) mediamtx is up but the player is stuck,
+    or (c) recordings are still landing on the NAS."""
     import re, time as _time
     if not re.match(r'^[a-zA-Z0-9_]+$', camera_id):
         raise HTTPException(400)
 
-    pidfile = Path(f"{camera_id}.pid")
-    logfile = Path(f"ffmpeg_{camera_id}.log")
-    hls_dir = Path("src/frontend/hls") / camera_id
-    rec_dir = Path("recordings") / camera_id
-    now = _time.time()
+    # Look up cam_type to know which mediamtx paths to inspect
+    cam_type = None
+    for c in LOREX_CAMERAS:
+        if c["id"] == camera_id: cam_type = "lorex"; break
+    if not cam_type:
+        for c in EZVIZ_CAMERAS:
+            if c["id"] == camera_id: cam_type = "ezviz"; break
+    if not cam_type:
+        for c in WYZE_RTSP_CAMERAS:
+            if c["id"] == camera_id: cam_type = "wyze_rtsp"; break
 
-    watchdog_pid = None
-    watchdog_alive = False
-    if pidfile.exists():
-        try:
-            watchdog_pid = int(pidfile.read_text().strip())
-            os.kill(watchdog_pid, 0)
-            watchdog_alive = True
-        except (ValueError, OSError):
-            pass
+    rec_path = camera_id
+    live_path = _hls_path(camera_id, cam_type) if cam_type else camera_id
 
-    latest_seg = latest_seg_age = m3u8_age = None
-    if hls_dir.exists():
-        segs = sorted(hls_dir.glob("seg*.ts"), key=lambda p: p.stat().st_mtime, reverse=True)
-        if segs:
-            latest_seg = segs[0].name
-            latest_seg_age = round(now - segs[0].stat().st_mtime, 1)
-        m3u8 = hls_dir / "stream.m3u8"
-        if m3u8.exists():
-            m3u8_age = round(now - m3u8.stat().st_mtime, 1)
+    rec_state = _mediamtx_path_state(rec_path)
+    live_state = _mediamtx_path_state(live_path) if live_path != rec_path else rec_state
 
+    # On-disk recording freshness
+    rec_dir = Path("recordings") / rec_path
     latest_rec = latest_rec_age = None
     if rec_dir.exists():
         recs = sorted(rec_dir.glob("*.ts"), key=lambda p: p.stat().st_mtime, reverse=True)
         if recs:
             latest_rec = recs[0].name
-            latest_rec_age = round(now - recs[0].stat().st_mtime, 1)
-
-    restart_count = 0
-    last_log_lines: list = []
-    if logfile.exists():
-        try:
-            content = logfile.read_text(errors="replace")
-            restart_count = content.count("restarting in 5s")
-            non_empty = [l for l in content.splitlines() if l.strip()]
-            last_log_lines = non_empty[-5:]
-        except Exception:
-            pass
+            latest_rec_age = round(_time.time() - recs[0].stat().st_mtime, 1)
 
     return {
         "camera_id": camera_id,
-        "watchdog_pid": watchdog_pid,
-        "watchdog_alive": watchdog_alive,
-        "latest_segment": latest_seg,
-        "latest_segment_age_s": latest_seg_age,
-        "m3u8_age_s": m3u8_age,
+        "live_path": live_path,
+        "rec_path": rec_path,
+        "live_ready": live_state.get("ready", False),
+        "live_bytes_received": live_state.get("bytesReceived"),
+        "live_readers": len(live_state.get("readers", [])),
+        "rec_ready": rec_state.get("ready", False),
+        "rec_bytes_received": rec_state.get("bytesReceived"),
+        "rec_source_type": (rec_state.get("source") or {}).get("type"),
         "latest_recording": latest_rec,
         "latest_recording_age_s": latest_rec_age,
-        "restart_count": restart_count,
-        "last_log_lines": last_log_lines,
     }
 
 
+@app.get("/api/diag")
+def diag_all():
+    """Whole-system diagnostic: every mediamtx path + global health."""
+    try:
+        r = requests.get(f"{MEDIAMTX_API}/v3/paths/list", timeout=3)
+        return {"mediamtx": r.json()}
+    except requests.RequestException as e:
+        return {"error": f"mediamtx unreachable: {e}"}
+
+
+# ── Recordings ────────────────────────────────────────────────────────────────
 @app.get("/api/recordings/{camera_id}")
 def list_recordings(camera_id: str):
     import time as _time

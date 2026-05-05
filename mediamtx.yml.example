@@ -1,0 +1,78 @@
+# mediamtx config for HomeCamera dashboard
+# Replaces 10 per-camera ffmpeg processes (HLS + recording) with one daemon
+# that handles RTSP reconnection internally and presents a continuous HLS
+# feed to the browser even when upstream cameras EOF.
+# Copy to mediamtx.yml and fill in real credentials/IPs.
+
+logLevel: info
+logDestinations: [stdout, file]
+logFile: mediamtx.log
+
+# Diagnostic / metrics endpoints
+api: yes
+apiAddress: 127.0.0.1:9997
+
+# We only need HLS out to the dashboard (and RTSP listening so mediamtx can
+# pull from cameras). Disable the rest to reduce attack surface.
+rtsp: yes
+rtspAddress: :8554
+rtmp: no
+webrtc: no
+srt: no
+
+# HLS server
+hls: yes
+hlsAddress: :8888
+hlsAllowOrigin: '*'
+hlsVariant: mpegts
+hlsSegmentCount: 6
+hlsSegmentDuration: 1s
+hlsAlwaysRemux: yes
+
+pathDefaults:
+  sourceOnDemand: no            # keep upstream connection alive 24/7
+  rtspTransport: tcp
+  recordFormat: mpegts
+  recordSegmentDuration: 5m
+  recordDeleteAfter: 0          # never auto-delete; NAS retention is manual
+
+paths:
+  # ── Lorex cameras ──────────────────────────────────────────────────────────
+  lorex_127:
+    source: rtsp://admin:YOUR_LOREX_PW@192.168.x.x:554/cam/realmonitor?channel=1&subtype=1&unicast=true&proto=Onvif
+  lorex_122:
+    source: rtsp://admin:YOUR_LOREX_PW@192.168.x.x:554/cam/realmonitor?channel=1&subtype=1&unicast=true&proto=Onvif
+
+  lorex_127_rec:
+    source: rtsp://admin:YOUR_LOREX_PW@192.168.x.x:554/cam/realmonitor?channel=1&subtype=0&unicast=true&proto=Onvif
+    record: yes
+    recordPath: ./recordings/lorex_127/%Y%m%d_%H%M%S
+  lorex_122_rec:
+    source: rtsp://admin:YOUR_LOREX_PW@192.168.x.x:554/cam/realmonitor?channel=1&subtype=0&unicast=true&proto=Onvif
+    record: yes
+    recordPath: ./recordings/lorex_122/%Y%m%d_%H%M%S
+
+  # ── Ezviz cameras ──────────────────────────────────────────────────────────
+  ezviz_78:
+    source: rtsp://admin:YOUR_EZVIZ_78_PW@10.0.0.x/H.264Preview_01_sub
+  ezviz_120:
+    source: rtsp://admin:YOUR_EZVIZ_120_PW@10.0.0.x/Streaming/Channels/102
+
+  ezviz_78_rec:
+    source: rtsp://admin:YOUR_EZVIZ_78_PW@10.0.0.x/H.264
+    record: yes
+    recordPath: ./recordings/ezviz_78/%Y%m%d_%H%M%S
+  ezviz_120_rec:
+    source: rtsp://admin:YOUR_EZVIZ_120_PW@10.0.0.x/Streaming/Channels/101
+    record: yes
+    recordPath: ./recordings/ezviz_120/%Y%m%d_%H%M%S
+
+  # ── Wyze V2 cameras (single RTSP session per cam — HLS + recording share) ─
+  wyze_126:
+    source: rtsp://YOUR_USER:YOUR_PW@192.168.x.x:554/live
+    record: yes
+    recordPath: ./recordings/wyze_126/%Y%m%d_%H%M%S
+  wyze_105:
+    source: rtsp://YOUR_USER:YOUR_PW@192.168.x.x:554/live
+    record: yes
+    recordPath: ./recordings/wyze_105/%Y%m%d_%H%M%S

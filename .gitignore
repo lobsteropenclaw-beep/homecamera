@@ -1,6 +1,7 @@
 # Secrets — never commit
 .env
 go2rtc.yaml
+mediamtx.yml
 
 # Runtime data
 recordings/

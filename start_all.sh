@@ -2,6 +2,13 @@
 
 # HomeCamera Unified Start Script
 # Must be run from the project root: /path/to/homecamera/
+#
+# Architecture:
+#   mediamtx → connects to each camera over RTSP, handles reconnection
+#              internally, exposes HLS on :8888 and writes recordings to NAS.
+#   FastAPI  → proxies /hls/* to mediamtx, hosts the dashboard SPA, exposes
+#              PTZ + diag endpoints.
+# Replaced 10 per-camera ffmpeg watchdogs with a single mediamtx process.
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
@@ -28,45 +35,26 @@ fi
 source venv/bin/activate
 echo "[✓] Python environment activated."
 
-# Helper: start a command in a self-restarting watchdog loop.
-# Usage: start_watched <pidfile> <logfile> <cmd...>
-# Saves the watchdog PID so stop_all.sh can kill the loop and its child.
-# Restart delay differs by exit code:
-#   code 0 → camera-side EOF (RTSP session ended cleanly). Restart in 1 s
-#            so the dashboard barely sees the gap. Cameras like Wyze V2 do
-#            this every 30 s, so a 5 s sleep was the dominant blackout cause.
-#   code != 0 → real failure (timeout, refused, codec error). Back off 5 s
-#            so we don't hammer a broken camera.
-start_watched() {
-    local pidfile=$1 logfile=$2; shift 2
-    (
-        trap 'pkill -P $$ 2>/dev/null; exit 0' TERM INT
-        while true; do
-            "$@" >> "$logfile" 2>&1
-            local code=$?
-            if [ $code -eq 0 ]; then
-                echo "[$(date '+%Y-%m-%d %H:%M:%S')] Process exited (code 0 — clean EOF), restarting in 1s..." >> "$logfile"
-                sleep 1
-            else
-                echo "[$(date '+%Y-%m-%d %H:%M:%S')] Process exited (code $code), restarting in 5s..." >> "$logfile"
-                sleep 5
-            fi
-        done
-    ) &
-    local pid=$!
-    disown $pid
-    echo $pid > "$pidfile"
-}
-
-# 3. Stop any old server/streams
+# 3. Stop any old server / mediamtx / leftover ffmpeg watchdogs
 OLD_PID=$(lsof -ti :8000 2>/dev/null)
 if [ -n "$OLD_PID" ]; then
     echo "[!] Killing old server process ($OLD_PID) on port 8000..."
     kill "$OLD_PID" 2>/dev/null
     sleep 1
 fi
-# Kill old watchdog loops and their ffmpeg children
-for pidfile in lorex_127.pid lorex_122.pid rec_lorex_127.pid rec_lorex_122.pid ezviz_78.pid rec_ezviz_78.pid ezviz_120.pid rec_ezviz_120.pid wyze_126.pid wyze_105.pid; do
+if [ -f mediamtx.pid ]; then
+    OLD=$(cat mediamtx.pid)
+    if kill -0 "$OLD" 2>/dev/null; then
+        echo "[!] Stopping old mediamtx (PID $OLD)..."
+        kill "$OLD" 2>/dev/null
+        sleep 1
+    fi
+    rm -f mediamtx.pid
+fi
+# Clean up any straggler watchdogs from the previous (pre-mediamtx) architecture
+for pidfile in lorex_127.pid lorex_122.pid rec_lorex_127.pid rec_lorex_122.pid \
+               ezviz_78.pid rec_ezviz_78.pid ezviz_120.pid rec_ezviz_120.pid \
+               wyze_126.pid wyze_105.pid; do
     if [ -f "$pidfile" ]; then
         OLD=$(cat "$pidfile")
         kill "$OLD" 2>/dev/null
@@ -76,7 +64,7 @@ for pidfile in lorex_127.pid lorex_122.pid rec_lorex_127.pid rec_lorex_122.pid e
 done
 sleep 1
 
-# 4. Mount NAS (if not already mounted)
+# 4. Mount NAS (if not already mounted) — recordings must land here, not local disk
 NAS_SHARE="//${NAS_USER}:${NAS_PASSWORD}@${NAS_IP}/${NAS_SHARE_NAME}"
 MOUNT_POINT="./recordings"
 mkdir -p "$MOUNT_POINT"
@@ -89,7 +77,6 @@ else
 fi
 
 # 4b. Safety check: confirm recordings path is on NAS (smbfs), not local disk.
-# Without this, a missing/dropped NAS mount would silently fall through to local.
 REC_FS=$(df "$MOUNT_POINT" | awk 'NR==2 {print $1}')
 if [[ "$REC_FS" != *"${NAS_IP}"* ]]; then
     echo "[✗] SAFETY CHECK FAILED: $MOUNT_POINT is on '$REC_FS', not NAS."
@@ -98,166 +85,66 @@ if [[ "$REC_FS" != *"${NAS_IP}"* ]]; then
 fi
 echo "[✓] Recordings path verified on NAS: $REC_FS"
 
-# 5. Start Lorex HLS streams via ffmpeg (auto-restarts on disconnect)
-mkdir -p src/frontend/hls/lorex_127 src/frontend/hls/lorex_122
+# 5. Start mediamtx
+if [ ! -f mediamtx.yml ]; then
+    echo "[✗] mediamtx.yml not found. Copy mediamtx.yml.example and fill in credentials."
+    exit 1
+fi
+if ! command -v mediamtx >/dev/null 2>&1; then
+    echo "[✗] mediamtx not installed. Install via: brew install mediamtx"
+    exit 1
+fi
 
-LOREX_RTSP_OPTS="-rtsp_transport tcp -timeout 5000000 -use_wallclock_as_timestamps 1"
-# omit_endlist: don't write #EXT-X-ENDLIST when ffmpeg exits, so hls.js keeps
-# polling for new segments after a watchdog restart instead of giving up.
-# hls_list_size 4: a slightly larger live window smooths over the brief moment
-# when ffmpeg is restarting (~7 s) — the player can keep playing buffered
-# segments while the new ffmpeg writes its first ones.
-LOREX_HLS_OPTS="-c:v copy -c:a aac -f hls -hls_time 1 -hls_list_size 4 -hls_flags delete_segments+split_by_time+omit_endlist"
+echo "[...] Starting mediamtx..."
+> mediamtx.log
+nohup mediamtx mediamtx.yml > mediamtx_console.log 2>&1 &
+MEDIAMTX_PID=$!
+echo "$MEDIAMTX_PID" > mediamtx.pid
 
-for cam_id in lorex_127 lorex_122; do
-    ip_var="$(echo "$cam_id" | tr '[:lower:]' '[:upper:]')_IP"
-    eval cam_ip=\$$ip_var
-    rtsp_url="rtsp://${LOREX_USER}:${LOREX_PASSWORD}@${cam_ip}:554/cam/realmonitor?channel=1&subtype=1&unicast=true&proto=Onvif"
-    hls_dir="src/frontend/hls/${cam_id}"
-    echo "[...] Starting HLS stream for ${cam_id} (${cam_ip})..."
-    # Truncate log on first start, then append on restarts
-    > "ffmpeg_${cam_id}.log"
-    start_watched "${cam_id}.pid" "ffmpeg_${cam_id}.log" \
-        ffmpeg $LOREX_RTSP_OPTS \
-        -i "$rtsp_url" \
-        $LOREX_HLS_OPTS \
-        -hls_segment_filename "${hls_dir}/seg%03d.ts" \
-        "${hls_dir}/stream.m3u8"
-    echo "[✓] ${cam_id} HLS watchdog PID: $(cat ${cam_id}.pid)"
+# Wait up to 10 s for mediamtx HTTP API to come up — proves config parsed and
+# server bound its listeners. After that we can query individual path readiness.
+echo "[...] Waiting for mediamtx API..."
+for i in $(seq 1 10); do
+    sleep 1
+    if curl -s http://127.0.0.1:9997/v3/paths/list >/dev/null 2>&1; then
+        echo "[✓] mediamtx is up (PID $MEDIAMTX_PID)"
+        break
+    fi
 done
+if ! curl -s http://127.0.0.1:9997/v3/paths/list >/dev/null 2>&1; then
+    echo "[✗] mediamtx did not start. Check mediamtx_console.log:"
+    tail -20 mediamtx_console.log
+    exit 1
+fi
 
-# 5b. Start Ezviz HLS streams (URL paths differ by model)
-# Audio is dropped (-an): Ezviz substream audio has erratic timestamps that
-# back up the AAC encoder and cause ffmpeg to exit every minute or two,
-# breaking the dashboard live preview. Recording (6b) keeps audio via main stream.
-# discardcorrupt: prevents "Invalid data found" mux errors from crashing ffmpeg.
-mkdir -p src/frontend/hls/ezviz_78 src/frontend/hls/ezviz_120
-for cam_id in ezviz_78 ezviz_120; do
-    ip_var="$(echo "$cam_id" | tr '[:lower:]' '[:upper:]')_IP"
-    pw_var="$(echo "$cam_id" | tr '[:lower:]' '[:upper:]')_PASSWORD"
-    eval cam_ip=\$$ip_var
-    eval cam_pw=\$$pw_var
-    case "$cam_id" in
-        ezviz_78)  sub_path="/H.264Preview_01_sub" ;;
-        ezviz_120) sub_path="/Streaming/Channels/102" ;;
-    esac
-    rtsp_url="rtsp://${EZVIZ_USER}:${cam_pw}@${cam_ip}${sub_path}"
-    hls_dir="src/frontend/hls/${cam_id}"
-    echo "[...] Starting HLS stream for ${cam_id} (${cam_ip})..."
-    > "ffmpeg_${cam_id}.log"
-    start_watched "${cam_id}.pid" "ffmpeg_${cam_id}.log" \
-        ffmpeg $LOREX_RTSP_OPTS \
-        -fflags +discardcorrupt \
-        -an \
-        -i "$rtsp_url" \
-        -c:v copy \
-        -f hls -hls_time 1 -hls_list_size 3 -hls_flags delete_segments+split_by_time+omit_endlist \
-        -hls_segment_filename "${hls_dir}/seg%03d.ts" \
-        "${hls_dir}/stream.m3u8"
-    echo "[✓] ${cam_id} HLS watchdog PID: $(cat ${cam_id}.pid)"
-done
-
-# 5c. Start Wyze HLS streams + 24/7 recording in a single ffmpeg per camera.
-# Wyze V2 RTSP firmware only allows one concurrent RTSP connection, so HLS and
-# recording must share one input stream via multiple output mapping.
-# Audio is dropped (-an): Wyze V2 audio has erratic timestamps that cause the
-# AAC encoder to back up and stall the entire pipeline.
-# Timeout 8s: V2 firmware stalls and never recovers without a full reconnect;
-# 8s balances fast recovery vs. not restarting on brief bursts.
-for cam_id in wyze_126 wyze_105; do
-    ip_var="$(echo "$cam_id" | tr '[:lower:]' '[:upper:]')_IP"
-    eval cam_ip=\$$ip_var
-    rtsp_url="rtsp://${WYZE_RTSP_USER}:${WYZE_RTSP_PASSWORD}@${cam_ip}:554/live"
-    hls_dir="src/frontend/hls/${cam_id}"
-    mkdir -p "$hls_dir" "recordings/${cam_id}"
-    echo "[...] Starting HLS + recording for ${cam_id} (${cam_ip})..."
-    > "ffmpeg_${cam_id}.log"
-    start_watched "${cam_id}.pid" "ffmpeg_${cam_id}.log" \
-        ffmpeg -rtsp_transport tcp -timeout 8000000 -use_wallclock_as_timestamps 1 \
-        -fflags +discardcorrupt \
-        -an \
-        -i "$rtsp_url" \
-        -c:v copy \
-        -f hls -hls_time 1 -hls_list_size 3 -hls_flags delete_segments+split_by_time+omit_endlist \
-        -hls_segment_filename "${hls_dir}/seg%03d.ts" \
-        "${hls_dir}/stream.m3u8" \
-        -c:v copy \
-        -f segment -segment_time 300 -strftime 1 -reset_timestamps 1 \
-        "recordings/${cam_id}/%Y%m%d_%H%M%S.ts"
-    echo "[✓] ${cam_id} watchdog PID: $(cat ${cam_id}.pid)"
-done
-
-# 6. Start 24/7 recording (main stream HEVC, auto-restarts on disconnect)
-mkdir -p recordings/lorex_127 recordings/lorex_122 recordings/ezviz_78 recordings/ezviz_120 recordings/wyze_126 recordings/wyze_105
-for cam_id in lorex_127 lorex_122; do
-    ip_var="$(echo "$cam_id" | tr '[:lower:]' '[:upper:]')_IP"
-    eval cam_ip=\$$ip_var
-    rtsp_url="rtsp://${LOREX_USER}:${LOREX_PASSWORD}@${cam_ip}:554/cam/realmonitor?channel=1&subtype=0&unicast=true&proto=Onvif"
-    echo "[...] Starting 24/7 recording for ${cam_id} (2K)..."
-    > "rec_${cam_id}.log"
-    start_watched "rec_${cam_id}.pid" "rec_${cam_id}.log" \
-        ffmpeg -rtsp_transport tcp -timeout 5000000 \
-        -use_wallclock_as_timestamps 1 \
-        -fflags +discardcorrupt \
-        -i "$rtsp_url" \
-        -c:v copy -c:a aac \
-        -f segment -segment_time 300 -strftime 1 -reset_timestamps 1 \
-        "recordings/${cam_id}/%Y%m%d_%H%M%S.ts"
-    echo "[✓] ${cam_id} recording watchdog PID: $(cat rec_${cam_id}.pid)"
-done
-
-# 6b. Start Ezviz 24/7 recordings (main stream, URL paths differ by model)
-# -c:a copy: camera already encodes AAC; copying avoids the AAC re-encoder
-# being fed backward-in-time audio packets from the Ezviz firmware, which
-# caused frequent "Queue input is backward in time" crashes.
-for cam_id in ezviz_78 ezviz_120; do
-    ip_var="$(echo "$cam_id" | tr '[:lower:]' '[:upper:]')_IP"
-    pw_var="$(echo "$cam_id" | tr '[:lower:]' '[:upper:]')_PASSWORD"
-    eval cam_ip=\$$ip_var
-    eval cam_pw=\$$pw_var
-    case "$cam_id" in
-        ezviz_78)  main_path="/H.264" ;;
-        ezviz_120) main_path="/Streaming/Channels/101" ;;
-    esac
-    rtsp_url="rtsp://${EZVIZ_USER}:${cam_pw}@${cam_ip}${main_path}"
-    echo "[...] Starting 24/7 recording for ${cam_id}..."
-    > "rec_${cam_id}.log"
-    start_watched "rec_${cam_id}.pid" "rec_${cam_id}.log" \
-        ffmpeg -rtsp_transport tcp -timeout 5000000 \
-        -use_wallclock_as_timestamps 1 \
-        -fflags +discardcorrupt \
-        -i "$rtsp_url" \
-        -c:v copy -c:a copy \
-        -f segment -segment_time 300 -strftime 1 -reset_timestamps 1 \
-        "recordings/${cam_id}/%Y%m%d_%H%M%S.ts"
-    echo "[✓] ${cam_id} recording watchdog PID: $(cat rec_${cam_id}.pid)"
-done
-
-
-# 7. Start the Backend API (survives terminal close via nohup)
+# 6. Start the Backend API (survives terminal close via nohup)
 echo "[...] Starting Dashboard on http://localhost:8000"
 nohup python src/backend/main.py > server.log 2>&1 &
 SERVER_PID=$!
 echo "$SERVER_PID" > server.pid
 
-# 8. Wait up to 15s for server and first HLS segment
+# 7. Wait up to 15s for server and report camera readiness
 echo "[...] Waiting for server to start..."
 for i in $(seq 1 15); do
     sleep 1
     if curl -s http://localhost:8000/ > /dev/null 2>&1; then
         echo "[✓] Dashboard is live at http://localhost:8000  (PID $SERVER_PID)"
-        sleep 3
-        for cam_id in lorex_127 lorex_122 ezviz_78 ezviz_120 wyze_126 wyze_105; do
-            seg_count=$(ls src/frontend/hls/${cam_id}/*.ts 2>/dev/null | wc -l | tr -d ' ')
-            if [ "$seg_count" -gt 0 ]; then
-                echo "[✓] ${cam_id}: HLS stream active (${seg_count} segments)"
+        sleep 2
+        # mediamtx-side readiness per path
+        for cam in lorex_127 lorex_122 ezviz_78 ezviz_120 wyze_126 wyze_105; do
+            ready=$(curl -s "http://127.0.0.1:9997/v3/paths/get/${cam}" \
+                | python3 -c "import json,sys; print(json.load(sys.stdin).get('ready', False))" 2>/dev/null || echo "?")
+            if [ "$ready" = "True" ]; then
+                echo "[✓] ${cam}: stream ready"
             else
-                echo "[!] ${cam_id}: HLS segments not yet ready — check ffmpeg_${cam_id}.log"
+                echo "[!] ${cam}: not ready yet — see /api/diag/${cam} or mediamtx.log"
             fi
         done
         echo ""
-        echo "[i] Logs:  tail -f $SCRIPT_DIR/server.log"
-        echo "[i] Stop:  bash $SCRIPT_DIR/stop_all.sh"
+        echo "[i] Logs:    tail -f $SCRIPT_DIR/server.log  (FastAPI)"
+        echo "[i] Logs:    tail -f $SCRIPT_DIR/mediamtx.log  (RTSP/HLS server)"
+        echo "[i] Diag:    curl localhost:8000/api/diag/<cam_id>"
+        echo "[i] Stop:    bash $SCRIPT_DIR/stop_all.sh"
         exit 0
     fi
 done
