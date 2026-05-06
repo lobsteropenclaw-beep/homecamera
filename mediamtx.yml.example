@@ -24,8 +24,10 @@ srt: no
 hls: yes
 hlsAddress: :8888
 hlsAllowOrigin: '*'
-hlsVariant: mpegts
-hlsSegmentCount: 6
+hlsVariant: fmp4
+# 12 segments × 1s = 12 s of buffer in the playlist. Lets clients ride through
+# brief upstream / network blips without showing the "retrying" placeholder.
+hlsSegmentCount: 12
 hlsSegmentDuration: 1s
 hlsAlwaysRemux: yes
 

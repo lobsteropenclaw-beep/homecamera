@@ -270,16 +270,19 @@ function attachHLS(cam) {
 
         log('creating new HLS instance');
         hls = new Hls({
-            liveSyncDurationCount: 2,
-            liveMaxLatencyDurationCount: 4,
-            maxBufferLength: 4,
-            maxMaxBufferLength: 8,
+            // Stay 4 segments behind live edge so we have buffered material
+            // to coast through brief upstream / network outages. Cost: about
+            // 4 s of playback latency vs real time. mediamtx exposes 12
+            // segments in the playlist for the same reason.
+            liveSyncDurationCount: 4,
+            liveMaxLatencyDurationCount: 10,
+            maxBufferLength: 12,
+            maxMaxBufferLength: 24,
             // Jump straight to live edge on recovery — no fast-play catch-up loop
             maxLiveSyncPlaybackRate: 1,
             liveBackBufferLength: 0,
-            // Cache-bust every HLS request. ffmpeg reuses segment names after a
-            // watchdog restart, so the browser's HTTP cache must never serve a
-            // stale seg000.ts from a previous run.
+            // Cache-bust every HLS request so a stale segment can never be
+            // served from the browser cache after an upstream reset.
             xhrSetup: (xhr, url) => {
                 const sep = url.includes('?') ? '&' : '?';
                 xhr.open('GET', url + sep + '_t=' + Date.now(), true);
