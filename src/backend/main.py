@@ -305,26 +305,112 @@ def diag_all():
 
 
 # ── Recordings ────────────────────────────────────────────────────────────────
+# Recordings live on a SMB-mounted NAS. Listing them is unavoidably slow:
+# scandir on a 3000-entry directory takes ~12 s over SMB, and per-file stat is
+# ~80 ms each (no readdirplus). We cache the listing in memory with a stale-
+# while-revalidate policy: requests after the first return instantly from cache
+# while a background thread refreshes if the cache is older than 30 s.
+import threading as _threading
+
+_REC_CACHE_TTL_S = 30
+_REC_LIMIT = 200
+_rec_cache: dict = {}                 # cam_id -> {"data": {...}, "fetched_at": float}
+_rec_cache_lock = _threading.Lock()
+_rec_refresh_in_progress: set = set()
+_rec_refresh_lock = _threading.Lock()
+
+
+def _scan_recordings_dir(camera_id: str) -> dict:
+    """Synchronous disk scan. Slow on SMB; only called from the cache layer."""
+    import time as _time, os as _os
+    rec_dir = Path("recordings") / camera_id
+    if not rec_dir.exists():
+        return {"recordings": [], "recording": False, "total": 0, "returned": 0}
+
+    entries = []
+    with _os.scandir(rec_dir) as it:
+        for e in it:
+            if e.name.endswith(".ts"):
+                entries.append(e)
+    # Filenames are YYYYMMDD_HHMMSS.ts so a name sort is chronological.
+    entries.sort(key=lambda e: e.name, reverse=True)
+    total = len(entries)
+    if total == 0:
+        return {"recordings": [], "recording": False, "total": 0, "returned": 0}
+
+    now = _time.time()
+    recording_active = (now - entries[0].stat().st_mtime) < 30
+    entries = entries[:_REC_LIMIT]
+
+    result = []
+    for i, e in enumerate(entries):
+        st = e.stat()
+        result.append({
+            "filename": e.name,
+            "playlist": f"/api/recordings/{camera_id}/{e.name}/stream.m3u8",
+            "size_mb": round(st.st_size / 1024 / 1024, 1),
+            "active": recording_active and i == 0,
+        })
+    return {
+        "recordings": result,
+        "recording": recording_active,
+        "total": total,
+        "returned": len(result),
+    }
+
+
+def _refresh_rec_cache(camera_id: str):
+    """Single-flight refresh: skip if another refresh is already running for
+    the same camera."""
+    import time as _time
+    with _rec_refresh_lock:
+        if camera_id in _rec_refresh_in_progress:
+            return
+        _rec_refresh_in_progress.add(camera_id)
+    try:
+        data = _scan_recordings_dir(camera_id)
+        with _rec_cache_lock:
+            _rec_cache[camera_id] = {"data": data, "fetched_at": _time.time()}
+    except Exception as e:
+        print(f"[recordings cache] refresh failed for {camera_id}: {e}")
+    finally:
+        with _rec_refresh_lock:
+            _rec_refresh_in_progress.discard(camera_id)
+
+
+def _all_camera_ids() -> list:
+    return [c["id"] for c in LOREX_CAMERAS + EZVIZ_CAMERAS + WYZE_RTSP_CAMERAS]
+
+
+def _prewarm_recordings():
+    """Run at startup so first user-facing request after server boot is fast."""
+    for cam_id in _all_camera_ids():
+        _threading.Thread(target=_refresh_rec_cache, args=(cam_id,), daemon=True).start()
+
+
+_prewarm_recordings()
+
+
 @app.get("/api/recordings/{camera_id}")
 def list_recordings(camera_id: str):
     import time as _time
-    rec_dir = Path("recordings") / camera_id
-    if not rec_dir.exists():
-        return {"camera_id": camera_id, "recordings": [], "recording": False}
-    files = sorted(rec_dir.glob("*.ts"), reverse=True)
     now = _time.time()
-    recording_active = bool(files) and (now - files[0].stat().st_mtime) < 30
-    result = []
-    for i, f in enumerate(files):
-        stat = f.stat()
-        active = recording_active and i == 0
-        result.append({
-            "filename": f.name,
-            "playlist": f"/api/recordings/{camera_id}/{f.name}/stream.m3u8",
-            "size_mb": round(stat.st_size / 1024 / 1024, 1),
-            "active": active,
-        })
-    return {"camera_id": camera_id, "recordings": result, "recording": recording_active}
+    with _rec_cache_lock:
+        cached = _rec_cache.get(camera_id)
+
+    if cached:
+        age = now - cached["fetched_at"]
+        # Always serve cache. If stale, kick off background refresh — next
+        # request gets fresh data, current one stays fast.
+        if age > _REC_CACHE_TTL_S:
+            _threading.Thread(target=_refresh_rec_cache, args=(camera_id,), daemon=True).start()
+        return {"camera_id": camera_id, **cached["data"], "cache_age_s": round(age, 1)}
+
+    # Cold cache (server just started, prewarm hasn't completed): synchronous scan.
+    data = _scan_recordings_dir(camera_id)
+    with _rec_cache_lock:
+        _rec_cache[camera_id] = {"data": data, "fetched_at": now}
+    return {"camera_id": camera_id, **data, "cache_age_s": 0.0}
 
 
 def _ts_duration(path: Path) -> float:
